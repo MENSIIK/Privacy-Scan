@@ -165,6 +165,11 @@ st.markdown(
     }
     .result-card h4 { margin: 0 0 .55rem; color: var(--green) !important; font-size: .9rem; }
     .result-card p { margin: 0; color: #f1fff4 !important; font-size: 1.08rem; font-weight: 750; overflow-wrap: anywhere; }
+    .scan-status { display: inline-block; padding: .28rem .5rem; border-radius: 7px; font-size: .76rem; font-weight: 800; line-height: 1.35; }
+    .scan-status.found { color: #80ffab !important; background: #102b18; border: 1px solid #2e8a4c; }
+    .scan-status.missing { color: #ffd98a !important; background: #2b2110; border: 1px solid #8d6822; }
+    div[data-testid="stCode"] { border: 1px solid #205b33; border-radius: 9px; }
+    div[data-testid="stCode"] pre { background: #030503 !important; color: #c4f5cf !important; }
     [data-testid="stVerticalBlockBorderWrapper"] { border-color: #205b33 !important; background: #080d09; border-radius: 12px; }
     [data-testid="stAlert"] { border-radius: 12px; }
     hr { border-color: #205b33 !important; }
@@ -198,8 +203,8 @@ st.markdown(
     <div class="module-grid">
       <div class="module-card"><div class="module-icon">🔒</div><div class="module-title">HTTPS 연결</div><div class="module-desc">연결 방식과 페이지 접속 여부 확인</div></div>
       <div class="module-card"><div class="module-icon">📄</div><div class="module-title">처리방침 탐색</div><div class="module-desc">개인정보 처리방침 링크 자동 검색</div></div>
-      <div class="module-card"><div class="module-icon">🗄️</div><div class="module-title">보관 기간</div><div class="module-desc">개인정보 보관 기간 관련 문구 확인</div></div>
-      <div class="module-card"><div class="module-icon">🔗</div><div class="module-title">제3자 제공</div><div class="module-desc">개인정보 제공 관련 설명 확인</div></div>
+      <div class="module-card"><div class="module-icon">🧭</div><div class="module-title">11개 주요 항목</div><div class="module-desc">수집·이용·보관·삭제 관련 안내 문구 검사</div></div>
+      <div class="module-card"><div class="module-icon">🛡️</div><div class="module-title">권리·보호 조치</div><div class="module-desc">정보주체 권리, 위탁, 국외 이전 및 보호 조치 확인</div></div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -253,11 +258,15 @@ if result:
         )
     with c3:
         topic_count = sum(1 for item in result["topic_results"] if item.found)
-        topic_label = f"{topic_count} / {len(result['topic_results'])}개 항목에서 문구 발견" if result["topic_results"] else "본문 분석 불가"
+        topic_total = len(result["topic_results"])
+        topic_label = f"{topic_count} / {topic_total}개 항목에서 근거 발견" if topic_total else "본문 분석 불가"
         st.markdown(
             '<div class="result-card"><h4>주요 안내 문구</h4><p>' + topic_label + "</p></div>",
             unsafe_allow_html=True,
         )
+
+    if result["topic_results"]:
+        st.progress(topic_count / topic_total, text=f"분석 항목 중 {topic_count}개에서 설정된 검색어와 일치하는 문구를 찾았습니다.")
 
     st.markdown("### 1. 개인정보 처리방침 링크")
     if result["policy_links"]:
@@ -270,20 +279,27 @@ if result:
     if result["policy_error"]:
         st.warning(result["policy_error"])
 
-    st.markdown("### 2. 주요 안내 문구 검사")
+    st.markdown("### 2. 개인정보 처리방침 항목별 근거 분석")
+    st.caption("각 항목은 정해 둔 검색어와 표현 패턴을 기준으로 검사합니다. 문구가 발견되었다고 정책의 내용이 충분하거나 적법하다는 뜻은 아닙니다.")
     if result["topic_results"]:
         for item in result["topic_results"]:
             with st.container(border=True):
                 left, right = st.columns([1, 3])
                 with left:
                     st.markdown(f"**{item.topic}**")
-                    st.write("✅ 관련 문구 발견" if item.found else "⚪ 관련 문구를 찾지 못함")
-                with right:
-                    if item.evidence:
-                        st.caption("발견 근거 일부")
-                        st.write("…" + item.evidence + "…")
+                    if item.found:
+                        st.markdown('<span class="scan-status found">● 근거 문구 발견</span>', unsafe_allow_html=True)
                     else:
-                        st.caption("분석된 문서에서 설정한 검색어와 일치하는 문구를 찾지 못했습니다.")
+                        st.markdown('<span class="scan-status missing">○ 검색어 일치 문구 미발견</span>', unsafe_allow_html=True)
+                with right:
+                    if item.found:
+                        st.caption("일치한 표현")
+                        st.code(item.matched_phrase or "일치 표현 정보 없음", language=None)
+                        st.caption("원문 문맥 — 일치한 표현 주변의 텍스트")
+                        st.code(item.evidence or "근거 문맥을 추출하지 못했습니다.", language=None)
+                        st.caption("자동 검색으로 발견한 문구입니다. 실제 개인정보 처리 방식의 안전성·법 준수 여부는 별도 확인이 필요합니다.")
+                    else:
+                        st.caption("설정된 검색어와 일치하는 표현을 찾지 못했습니다. 같은 의미가 다른 표현으로 작성되었거나 페이지 구조 때문에 탐지되지 않았을 수 있습니다.")
     elif result["policy_links"]:
         st.info("개인정보 처리방침 링크는 발견했지만, 같은 호스트에서 자동 분석할 수 있는 문서를 가져오지 못했습니다.")
     else:
@@ -291,8 +307,9 @@ if result:
 
     st.markdown("### 3. 결과 해석")
     st.write(
-        "이 화면은 확인 가능한 공개 문구를 요약합니다. '문구를 찾지 못함'은 해당 정책이 실제로 없다는 뜻이 아니며, "
-        "'문구 발견'도 실제 처리 과정이 안전하다는 증거는 아닙니다. 중요한 판단은 원문 정책과 서비스 설정을 함께 확인하세요."
+        f"이 화면은 개인정보 처리방침에서 {len(result['topic_results'])}개 주제와 관련된 문구가 발견되는지 요약합니다. "
+        "'검색어와 일치하는 문구 미발견'은 해당 정책이 실제로 없다는 뜻이 아닙니다. 표현 방식이나 페이지 구조가 달라 자동 탐지되지 않을 수 있습니다. "
+        "'근거 문구 발견'도 실제 처리 과정이 안전하거나 법을 준수한다는 증거는 아니므로 원문 정책과 서비스 설정을 함께 확인하세요."
     )
 
 st.markdown("---")
