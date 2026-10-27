@@ -2,26 +2,180 @@ import streamlit as st
 from scanner_core import ScanError, analyze_website
 
 st.set_page_config(
-    page_title="웹사이트 개인정보 보호 정보 자동 점검기",
+    page_title="Privacy Scan | 개인정보 보호 자동 점검기",
     page_icon="🛡️",
     layout="wide",
 )
 
+# High-contrast black + neon-green theme with a blue primary action button.
 st.markdown(
     """
     <style>
-    .stApp { background: linear-gradient(180deg, #0b1220 0%, #101b2d 100%); color: #edf3fb; }
-    [data-testid="stHeader"] { background: rgba(0,0,0,0); }
-    [data-testid="stSidebar"] { background-color: #101827; }
-    .hero { padding: 1.35rem 1.5rem; border: 1px solid #28384f; border-radius: 18px;
-            background: linear-gradient(135deg, #14243a, #122d36); margin-bottom: 1rem; }
-    .hero h1 { margin: 0; font-size: 2rem; color: #f4f8ff; }
-    .hero p { margin: .55rem 0 0 0; color: #b8c9dc; }
-    .small-muted { color: #aabbd0; font-size: .9rem; }
-    .result-card { border: 1px solid #2c4058; background: rgba(20, 35, 54, .82);
-                   padding: 1rem; border-radius: 14px; min-height: 100px; }
-    .result-card h4 { margin: 0 0 .5rem 0; color: #b7cbe1; font-size: .95rem; }
-    .result-card p { margin: 0; color: #f1f6fc; font-size: 1.05rem; }
+    :root {
+        --bg: #050705;
+        --panel: #0b110c;
+        --panel-2: #101a12;
+        --green: #39ff79;
+        --green-soft: #b8ffc9;
+        --muted: #91ab97;
+        --line: #205b33;
+        --blue: #1769ff;
+        --blue-hover: #3980ff;
+    }
+
+    html, body, [data-testid="stAppViewContainer"], .stApp {
+        background: var(--bg) !important;
+        color: var(--green-soft) !important;
+    }
+    [data-testid="stHeader"] { background: rgba(5, 7, 5, 0.96) !important; }
+    [data-testid="stSidebar"] { background: #080d09 !important; border-right: 1px solid var(--line); }
+    [data-testid="stToolbar"] { right: 1rem; }
+    [data-testid="stDecoration"] { background-image: linear-gradient(90deg, #39ff79, #1769ff) !important; }
+
+    .stApp, .stApp p, .stApp li, .stApp label, .stApp [data-testid="stCaptionContainer"] {
+        color: var(--green-soft);
+    }
+    h1, h2, h3, h4, h5, h6 {
+        color: var(--green) !important;
+        letter-spacing: 0.01em;
+    }
+    a { color: #70a6ff !important; }
+    a:hover { color: #b4d0ff !important; }
+    [data-testid="stCaptionContainer"] p, .small-muted { color: var(--muted) !important; }
+
+    .hero {
+        padding: 1.5rem 1.6rem;
+        border: 1px solid var(--green);
+        border-radius: 18px;
+        background: radial-gradient(circle at 90% 0%, #10311a 0%, transparent 38%),
+                    linear-gradient(135deg, #0b110c 0%, #07120b 65%, #091426 100%);
+        box-shadow: 0 0 24px rgba(57, 255, 121, 0.10), inset 0 0 20px rgba(57, 255, 121, 0.025);
+        margin: 0 0 1rem 0;
+    }
+    .hero .eyebrow {
+        color: var(--green) !important;
+        font-size: .78rem;
+        font-weight: 800;
+        letter-spacing: .17em;
+        margin: 0 0 .45rem 0;
+    }
+    .hero h1 { margin: 0; font-size: clamp(1.65rem, 3vw, 2.35rem); color: #39ff79 !important; }
+    .hero p { margin: .65rem 0 0; color: #b8ffc9 !important; font-size: 1rem; }
+
+    .system-status {
+        display: inline-block;
+        border: 1px solid #267c43;
+        color: var(--green) !important;
+        background: #102619;
+        padding: .35rem .6rem;
+        border-radius: 8px;
+        font-size: .75rem;
+        font-weight: 800;
+        letter-spacing: .07em;
+        margin-top: .85rem;
+    }
+    .notice {
+        border: 1px solid #28543a;
+        background: #0a100b;
+        border-left: 4px solid var(--green);
+        color: #c4f5cf !important;
+        padding: .85rem 1rem;
+        border-radius: 10px;
+        margin: .8rem 0 1.1rem;
+    }
+    .section-kicker {
+        color: var(--green) !important;
+        font-size: .78rem;
+        font-weight: 800;
+        letter-spacing: .14em;
+        margin: .5rem 0 .75rem;
+    }
+    .module-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; margin: .8rem 0 1.2rem; }
+    .module-card {
+        border: 1px solid var(--line);
+        background: linear-gradient(145deg, #0b110c, #0a100d);
+        border-radius: 14px;
+        padding: 1rem;
+        min-height: 128px;
+        box-shadow: 0 0 14px rgba(57,255,121,.035);
+    }
+    .module-card .module-icon { font-size: 1.55rem; margin-bottom: .45rem; }
+    .module-card .module-title { color: #f1fff4 !important; font-weight: 800; margin-bottom: .35rem; }
+    .module-card .module-desc { color: #91ab97 !important; font-size: .84rem; line-height: 1.4; }
+
+    div[data-testid="stForm"] {
+        background: #080d09;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 1rem 1rem .75rem;
+        box-shadow: 0 0 20px rgba(57,255,121,.045);
+    }
+    div[data-testid="stTextInput"] label, div[data-testid="stTextInput"] label p {
+        color: var(--green) !important;
+        font-weight: 700 !important;
+    }
+    div[data-testid="stTextInput"] input {
+        background: #030503 !important;
+        color: #b8ffc9 !important;
+        border: 1px solid #267c43 !important;
+        border-radius: 10px !important;
+        min-height: 3rem;
+        caret-color: var(--green);
+    }
+    div[data-testid="stTextInput"] input:focus {
+        border-color: var(--green) !important;
+        box-shadow: 0 0 0 .18rem rgba(57,255,121,.15) !important;
+    }
+    div[data-testid="stTextInput"] input::placeholder { color: #66816d !important; }
+
+    /* Make the main action button blue and visually dominant. */
+    [data-testid="stFormSubmitButton"] button,
+    [data-testid="stBaseButton-primary"],
+    button[kind="primary"] {
+        background: var(--blue) !important;
+        color: #ffffff !important;
+        border: 1px solid #5b96ff !important;
+        border-radius: 10px !important;
+        min-height: 3rem !important;
+        font-weight: 800 !important;
+        box-shadow: 0 5px 20px rgba(23,105,255,.28) !important;
+        transition: background .15s ease, box-shadow .15s ease, transform .15s ease;
+    }
+    [data-testid="stFormSubmitButton"] button:hover,
+    [data-testid="stBaseButton-primary"]:hover,
+    button[kind="primary"]:hover {
+        background: var(--blue-hover) !important;
+        border-color: #91b8ff !important;
+        box-shadow: 0 0 24px rgba(23,105,255,.45) !important;
+        transform: translateY(-1px);
+    }
+    [data-testid="stFormSubmitButton"] button:focus-visible,
+    [data-testid="stBaseButton-primary"]:focus-visible {
+        outline: 3px solid #9cc2ff !important;
+        outline-offset: 3px !important;
+    }
+
+    .result-card {
+        border: 1px solid #267c43;
+        background: linear-gradient(145deg, #0c150e, #0a100b);
+        padding: 1.05rem;
+        border-radius: 14px;
+        min-height: 112px;
+        box-shadow: 0 0 15px rgba(57,255,121,.05);
+    }
+    .result-card h4 { margin: 0 0 .55rem; color: var(--green) !important; font-size: .9rem; }
+    .result-card p { margin: 0; color: #f1fff4 !important; font-size: 1.08rem; font-weight: 750; overflow-wrap: anywhere; }
+    [data-testid="stVerticalBlockBorderWrapper"] { border-color: #205b33 !important; background: #080d09; border-radius: 12px; }
+    [data-testid="stAlert"] { border-radius: 12px; }
+    hr { border-color: #205b33 !important; }
+
+    @media (max-width: 800px) {
+        .module-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .hero { padding: 1.1rem; }
+    }
+    @media (max-width: 480px) {
+        .module-grid { grid-template-columns: 1fr; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -30,25 +184,35 @@ st.markdown(
 st.markdown(
     """
     <div class="hero">
-      <h1>🛡️ 웹사이트 개인정보 보호 정보 자동 점검기</h1>
-      <p>공개 웹페이지와 개인정보 처리방침에서 주요 안내 문구를 찾아 확인합니다.</p>
+      <div class="eyebrow">WEB SECURITY ANALYZER</div>
+      <h1>🛡️ PRIVACY SCAN</h1>
+      <p>웹사이트 개인정보 보호 정보를 자동으로 점검합니다.</p>
+      <div class="system-status">● SYSTEM READY</div>
+    </div>
+    <div class="notice">
+      <strong>검사 안내</strong><br>
+      공개 웹페이지와 개인정보 처리방침에서 확인 가능한 문구를 분석합니다.
+      실제 보안성이나 법 준수 여부를 확정하는 도구는 아닙니다.
+    </div>
+    <div class="section-kicker">SCAN MODULES</div>
+    <div class="module-grid">
+      <div class="module-card"><div class="module-icon">🔒</div><div class="module-title">HTTPS 연결</div><div class="module-desc">연결 방식과 페이지 접속 여부 확인</div></div>
+      <div class="module-card"><div class="module-icon">📄</div><div class="module-title">처리방침 탐색</div><div class="module-desc">개인정보 처리방침 링크 자동 검색</div></div>
+      <div class="module-card"><div class="module-icon">🗄️</div><div class="module-title">보관 기간</div><div class="module-desc">개인정보 보관 기간 관련 문구 확인</div></div>
+      <div class="module-card"><div class="module-icon">🔗</div><div class="module-title">제3자 제공</div><div class="module-desc">개인정보 제공 관련 설명 확인</div></div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-st.info(
-    "학습용 도구입니다. 사이트의 실제 보안성이나 법 준수 여부를 확정하지 않습니다. "
-    "분석 결과는 공개된 HTML에서 관련 문구를 찾았는지에 대한 참고 정보입니다."
-)
-
+st.markdown('<div class="section-kicker">TARGET URL</div>', unsafe_allow_html=True)
 with st.form("scan_form"):
     url = st.text_input(
         "분석할 웹사이트 주소",
         placeholder="https://example.com",
         help="공개 웹사이트 주소를 입력하세요. 주소 앞에 https://를 생략해도 됩니다.",
     )
-    submitted = st.form_submit_button("🔍 자동 분석 시작", type="primary", use_container_width=True)
+    submitted = st.form_submit_button("🔎 검색 시작", type="primary", use_container_width=True)
 
 if submitted:
     try:
@@ -66,6 +230,7 @@ if submitted:
 result = st.session_state.get("last_scan_result")
 if result:
     st.markdown("---")
+    st.markdown('<div class="section-kicker">ANALYSIS REPORT</div>', unsafe_allow_html=True)
     st.subheader("분석 결과")
     st.caption(f"입력 주소: {result['requested_url']}")
     st.caption(f"최종 주소: {result['final_url']}")
