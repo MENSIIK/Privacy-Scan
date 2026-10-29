@@ -1,5 +1,21 @@
 import streamlit as st
-from scanner_core import ScanError, analyze_website
+from scanner_core import ScanError, analyze_website, analyze_policy_text
+
+EXPECTED_TOPIC_COUNT = 11
+
+
+def _item_value(item, key, default=None):
+    """Read result fields from either current dataclasses or older dict/object results."""
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
+def _policy_html(policy):
+    """Support policy results represented as either an object or a dictionary."""
+    if isinstance(policy, dict):
+        return policy.get("html", "")
+    return getattr(policy, "html", "")
 
 st.set_page_config(
     page_title="Privacy Scan | 개인정보 보호 자동 점검기",
@@ -234,6 +250,18 @@ if submitted:
 
 result = st.session_state.get("last_scan_result")
 if result:
+    # Self-heal results kept in Streamlit session state from an older 4-topic build.
+    # Re-run the current 11-topic matcher against the already-fetched policy HTML.
+    current_topics = result.get("topic_results", []) or []
+    policy_html = _policy_html(result.get("policy"))
+    if policy_html and len(current_topics) < EXPECTED_TOPIC_COUNT:
+        try:
+            current_topics = analyze_policy_text(policy_html)
+            result["topic_results"] = current_topics
+            st.session_state["last_scan_result"] = result
+        except Exception:
+            # Keep the existing results; the display below is defensive as well.
+            pass
     st.markdown("---")
     st.markdown('<div class="section-kicker">ANALYSIS REPORT</div>', unsafe_allow_html=True)
     st.subheader("분석 결과")
@@ -257,7 +285,7 @@ if result:
             unsafe_allow_html=True,
         )
     with c3:
-        topic_count = sum(1 for item in result["topic_results"] if item.found)
+        topic_count = sum(1 for item in result["topic_results"] if _item_value(item, "found", False))
         topic_total = len(result["topic_results"])
         topic_label = f"{topic_count} / {topic_total}개 항목에서 근거 발견" if topic_total else "본문 분석 불가"
         st.markdown(
@@ -283,20 +311,26 @@ if result:
     st.caption("각 항목은 정해 둔 검색어와 표현 패턴을 기준으로 검사합니다. 문구가 발견되었다고 정책의 내용이 충분하거나 적법하다는 뜻은 아닙니다.")
     if result["topic_results"]:
         for item in result["topic_results"]:
+            item_topic = _item_value(item, "topic", "검사 항목")
+            item_found = bool(_item_value(item, "found", False))
+            # Older deployments did not include matched_phrase; avoid crashing if an
+            # old result object survives in session state during an app update.
+            item_phrase = _item_value(item, "matched_phrase", "") or ""
+            item_evidence = _item_value(item, "evidence", "") or ""
             with st.container(border=True):
                 left, right = st.columns([1, 3])
                 with left:
-                    st.markdown(f"**{item.topic}**")
-                    if item.found:
+                    st.markdown(f"**{item_topic}**")
+                    if item_found:
                         st.markdown('<span class="scan-status found">● 근거 문구 발견</span>', unsafe_allow_html=True)
                     else:
                         st.markdown('<span class="scan-status missing">○ 검색어 일치 문구 미발견</span>', unsafe_allow_html=True)
                 with right:
-                    if item.found:
+                    if item_found:
                         st.caption("일치한 표현")
-                        st.code(item.matched_phrase or "일치 표현 정보 없음", language=None)
+                        st.code(item_phrase or "일치 표현 정보 없음", language=None)
                         st.caption("원문 문맥 — 일치한 표현 주변의 텍스트")
-                        st.code(item.evidence or "근거 문맥을 추출하지 못했습니다.", language=None)
+                        st.code(item_evidence or "근거 문맥을 추출하지 못했습니다.", language=None)
                         st.caption("자동 검색으로 발견한 문구입니다. 실제 개인정보 처리 방식의 안전성·법 준수 여부는 별도 확인이 필요합니다.")
                     else:
                         st.caption("설정된 검색어와 일치하는 표현을 찾지 못했습니다. 같은 의미가 다른 표현으로 작성되었거나 페이지 구조 때문에 탐지되지 않았을 수 있습니다.")
@@ -317,3 +351,4 @@ st.caption(
     "안전장치: 로컬·사설 IP 차단, 리디렉션 목적지 재검사, 접속 시간 제한, HTML 응답 크기 제한, "
     "동일 호스트의 개인정보 처리방침 링크만 자동 분석. 실제 비밀번호나 개인정보를 입력하지 마세요."
 )
+st.caption("Privacy Scan v2.1 · 11개 항목 분석기 · 이전 분석 결과 호환 처리 포함")
