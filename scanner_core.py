@@ -1,34 +1,43 @@
-"""Privacy Scan: 웹사이트 개인정보 보호 정보 분석 모듈.
+"""Core logic for Privacy Scan.
 
-공개 웹페이지에서 개인정보 처리방침과 관련 문구를 찾아 분석합니다.
-문구 발견 여부만 검사하며, 실제 보안성이나 법률 준수 여부를 보증하지 않습니다.
+Public website/privacy policy analysis + VirusTotal Public API v3.
+This is an educational tool, not a guarantee of website safety.
 """
 
 from __future__ import annotations
 
+import base64
 import http.client
 import ipaddress
 import re
 import socket
 import ssl
+
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+import requests
 from bs4 import BeautifulSoup
 
 
-# --------------------------------------------------
-# 기본 설정
-# --------------------------------------------------
+# ==========================================
+# BASIC SETTINGS
+# ==========================================
 
 MAX_HTML_BYTES = 1_000_000
 MAX_REDIRECTS = 4
 REQUEST_TIMEOUT_SECONDS = 7
 
-USER_AGENT = "SchoolPrivacyInfoChecker/1.0 (educational project)"
+USER_AGENT = "SchoolPrivacyInfoChecker/2.2"
+
+VIRUSTOTAL_BASE_URL = "https://www.virustotal.com/api/v3"
+VIRUSTOTAL_TIMEOUT_SECONDS = 20
 
 
-# 개인정보 처리방침 링크를 찾을 때 사용하는 표현
+# ==========================================
+# PRIVACY POLICY SETTINGS
+# ==========================================
+
 POLICY_TERMS = (
     "개인정보처리방침",
     "개인정보 처리방침",
@@ -39,11 +48,8 @@ POLICY_TERMS = (
 )
 
 
-# --------------------------------------------------
-# 11개 개인정보 검사 항목
-# --------------------------------------------------
-
 TOPIC_PATTERNS = {
+
     "개인정보 수집 항목": [
         r"개인정보.{0,12}수집.{0,8}항목",
         r"수집하는 개인정보 항목",
@@ -136,12 +142,20 @@ TOPIC_PATTERNS = {
 }
 
 
-# --------------------------------------------------
-# 결과 자료형과 오류 처리
-# --------------------------------------------------
+# ==========================================
+# EXCEPTIONS AND DATA CLASSES
+# ==========================================
 
 class ScanError(Exception):
-    """사용자에게 표시할 수 있는 예상 가능한 분석 오류."""
+    """Website scanning error."""
+
+
+class VirusTotalError(Exception):
+    """Safe, user-facing VirusTotal API error."""
+
+
+class VirusTotalNotFoundError(VirusTotalError):
+    """VirusTotal does not have a report for this URL yet."""
 
 
 @dataclass
@@ -161,12 +175,12 @@ class TopicResult:
     matched_phrase: str = ""
 
 
-# --------------------------------------------------
-# URL 검증
-# --------------------------------------------------
+# ==========================================
+# URL VALIDATION
+# ==========================================
 
 def normalize_url(raw_url: str) -> str:
-    """입력 URL을 정리하고 허용하지 않는 주소를 차단한다."""
+    """Normalize URL and reject unsafe URL syntax."""
 
     value = (raw_url or "").strip()
 
@@ -179,6 +193,7 @@ def normalize_url(raw_url: str) -> str:
     try:
         parsed = urlsplit(value)
         port = parsed.port
+
     except ValueError as exc:
         raise ScanError(
             "주소의 포트 형식이 올바르지 않습니다."
@@ -206,40 +221,59 @@ def normalize_url(raw_url: str) -> str:
 
     if (
         host in {"localhost", "localhost.localdomain"}
-        or host.endswith((".localhost", ".local", ".internal"))
+        or host.endswith(
+            (".localhost", ".local", ".internal")
+        )
     ):
         raise ScanError(
             "로컬 네트워크 주소는 분석할 수 없습니다."
         )
 
-    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    # Reject private, loopback and reserved IP literals.
+    try:
+        literal_ip = ipaddress.ip_address(host)
+
+    except ValueError:
+        literal_ip = None
+
+    if literal_ip is not None and not literal_ip.is_global:
+        raise ScanError(
+            "공개 인터넷 IP 주소만 분석할 수 있습니다."
+        )
+
+    default_port = (
+        443 if parsed.scheme.lower() == "https" else 80
+    )
 
     if port is not None and port != default_port:
         raise ScanError(
-            "안전한 범위 유지를 위해 기본 웹 포트"
-            "(HTTP 80, HTTPS 443)만 분석합니다."
+            "HTTP 80 또는 HTTPS 443 포트만 분석할 수 있습니다."
         )
 
     is_ipv6 = ":" in host
     authority_host = f"[{host}]" if is_ipv6 else host
 
+    path = parsed.path or "/"
+
     return urlunsplit(
         (
             parsed.scheme.lower(),
             authority_host,
-            parsed.path or "/",
+            path,
             parsed.query,
             "",
         )
     )
 
 
-# --------------------------------------------------
-# 공개 IP 주소 확인
-# --------------------------------------------------
+# ==========================================
+# PUBLIC IP VALIDATION
+# ==========================================
 
-def _resolve_public_addresses(host: str, port: int) -> list[str]:
-    """도메인이 공개 인터넷 IP로 연결되는지 확인한다."""
+def _resolve_public_addresses(
+    host: str,
+    port: int,
+) -> list[str]:
 
     try:
         literal_ip = ipaddress.ip_address(host)
@@ -252,6 +286,7 @@ def _resolve_public_addresses(host: str, port: int) -> list[str]:
                 port,
                 type=socket.SOCK_STREAM,
             )
+
         except socket.gaierror as exc:
             raise ScanError(
                 "도메인 주소를 확인할 수 없습니다. "
@@ -259,15 +294,20 @@ def _resolve_public_addresses(host: str, port: int) -> list[str]:
             ) from exc
 
         addresses = list(
-            dict.fromkeys(info[4][0] for info in infos)
+            dict.fromkeys(
+                info[4][0] for info in infos
+            )
         )
 
     if not addresses:
-        raise ScanError("도메인 주소를 확인할 수 없습니다.")
+        raise ScanError(
+            "도메인 주소를 확인할 수 없습니다."
+        )
 
     for address in addresses:
         try:
             parsed_ip = ipaddress.ip_address(address)
+
         except ValueError as exc:
             raise ScanError(
                 "도메인 주소를 안전하게 확인할 수 없습니다."
@@ -282,12 +322,13 @@ def _resolve_public_addresses(host: str, port: int) -> list[str]:
     return addresses
 
 
-# --------------------------------------------------
-# IP 주소를 고정한 HTTP 연결
-# --------------------------------------------------
+# ==========================================
+# SAFE HTTP CONNECTION
+# ==========================================
 
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    """검증한 IP 주소로 HTTP 연결을 생성한다."""
+class _PinnedHTTPConnection(
+    http.client.HTTPConnection
+):
 
     def __init__(
         self,
@@ -301,6 +342,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
             port=port,
             timeout=timeout,
         )
+
         self._connect_ip = connect_ip
 
     def connect(self):
@@ -310,8 +352,9 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
         )
 
 
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """검증된 IP로 연결하면서 원래 도메인의 TLS 인증서를 확인한다."""
+class _PinnedHTTPSConnection(
+    http.client.HTTPSConnection
+):
 
     def __init__(
         self,
@@ -326,6 +369,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             timeout=timeout,
             context=ssl.create_default_context(),
         )
+
         self._connect_ip = connect_ip
 
     def connect(self):
@@ -339,49 +383,58 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
                 raw_sock,
                 server_hostname=self.host,
             )
+
         except Exception:
             raw_sock.close()
             raise
 
 
-def _host_header(host: str, port: int, scheme: str) -> str:
-    """HTTP 요청에 사용할 Host 헤더를 만든다."""
+def _host_header(
+    host: str,
+    port: int,
+    scheme: str,
+) -> str:
 
     safe_host = f"[{host}]" if ":" in host else host
-    default_port = 443 if scheme == "https" else 80
 
-    if port == default_port:
-        return safe_host
+    default_port = (
+        443 if scheme == "https" else 80
+    )
 
-    return f"{safe_host}:{port}"
+    return (
+        safe_host
+        if port == default_port
+        else f"{safe_host}:{port}"
+    )
 
 
-# --------------------------------------------------
-# 공개 웹페이지 HTML 가져오기
-# --------------------------------------------------
+# ==========================================
+# FETCH PUBLIC HTML
+# ==========================================
 
 def fetch_public_html(raw_url: str) -> FetchResult:
-    """공개 웹페이지를 가져온다.
-
-    - 리디렉션마다 URL과 IP를 다시 검증한다.
-    - 요청 시간과 HTML 크기를 제한한다.
-    - HTML 또는 XHTML 응답만 분석한다.
-    """
+    """Fetch public HTML with redirect and network safety checks."""
 
     original = normalize_url(raw_url)
     current = original
 
     for redirect_count in range(MAX_REDIRECTS + 1):
+
         current = normalize_url(current)
         parsed = urlsplit(current)
 
         host = parsed.hostname or ""
         scheme = parsed.scheme
+
         port = parsed.port or (
             443 if scheme == "https" else 80
         )
 
-        addresses = _resolve_public_addresses(host, port)
+        addresses = _resolve_public_addresses(
+            host,
+            port,
+        )
+
         connect_ip = addresses[0]
 
         path = parsed.path or "/"
@@ -396,6 +449,7 @@ def fetch_public_html(raw_url: str) -> FetchResult:
                 connect_ip,
                 REQUEST_TIMEOUT_SECONDS,
             )
+
         else:
             connection = _PinnedHTTPConnection(
                 host,
@@ -409,7 +463,11 @@ def fetch_public_html(raw_url: str) -> FetchResult:
                 "GET",
                 path,
                 headers={
-                    "Host": _host_header(host, port, scheme),
+                    "Host": _host_header(
+                        host,
+                        port,
+                        scheme,
+                    ),
                     "User-Agent": USER_AGENT,
                     "Accept": (
                         "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1"
@@ -420,6 +478,7 @@ def fetch_public_html(raw_url: str) -> FetchResult:
             )
 
             response = connection.getresponse()
+
             status = response.status
             location = response.getheader("Location")
 
@@ -427,8 +486,9 @@ def fetch_public_html(raw_url: str) -> FetchResult:
                 response.getheader("Content-Type") or ""
             ).lower()
 
-            # 리디렉션 처리
+            # Redirect
             if status in {301, 302, 303, 307, 308}:
+
                 response.read(1024)
 
                 if not location:
@@ -451,8 +511,9 @@ def fetch_public_html(raw_url: str) -> FetchResult:
                     "접근이 제한되었을 수 있습니다."
                 )
 
-            # HTML 크기를 제한한다.
-            body = response.read(MAX_HTML_BYTES + 1)
+            body = response.read(
+                MAX_HTML_BYTES + 1
+            )
 
             if len(body) > MAX_HTML_BYTES:
                 raise ScanError(
@@ -471,9 +532,13 @@ def fetch_public_html(raw_url: str) -> FetchResult:
 
             if (
                 content_type_main
-                not in {"text/html", "application/xhtml+xml"}
+                not in {
+                    "text/html",
+                    "application/xhtml+xml",
+                }
                 and not (
-                    not content_type_main and looks_like_html
+                    not content_type_main
+                    and looks_like_html
                 )
             ):
                 raise ScanError(
@@ -491,6 +556,7 @@ def fetch_public_html(raw_url: str) -> FetchResult:
                     charset or "utf-8",
                     errors="replace",
                 )
+
             except LookupError:
                 html = body.decode(
                     "utf-8",
@@ -519,49 +585,66 @@ def fetch_public_html(raw_url: str) -> FetchResult:
             ValueError,
         ) as exc:
             raise ScanError(
-                "사이트에 접속하지 못했습니다. 주소, 연결 상태 "
-                "또는 사이트의 자동 접속 제한을 확인해 주세요."
+                "사이트에 접속하지 못했습니다. "
+                "주소, 연결 상태 또는 사이트의 자동 접속 제한을 "
+                "확인해 주세요."
             ) from exc
 
         finally:
             connection.close()
 
-    raise ScanError("웹사이트에 접속하지 못했습니다.")
+    raise ScanError(
+        "웹사이트에 접속하지 못했습니다."
+    )
 
 
-# --------------------------------------------------
-# 개인정보 처리방침 링크 찾기
-# --------------------------------------------------
+# ==========================================
+# PRIVACY POLICY LINK DETECTION
+# ==========================================
 
 def find_privacy_policy_links(
     html: str,
     page_url: str,
 ) -> list[dict[str, str]]:
-    """HTML에서 개인정보 처리방침으로 보이는 링크를 찾는다.
 
-    자동으로 열 수 있는 후보는 같은 호스트에 있는 링크뿐이다.
-    """
-
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
 
     base_host = (
         urlsplit(page_url).hostname or ""
     ).lower()
 
-    found: list[dict[str, str]] = []
-    seen: set[str] = set()
+    found = []
+    seen = set()
 
-    for anchor in soup.find_all("a", href=True):
-        href = (anchor.get("href") or "").strip()
+    for anchor in soup.find_all(
+        "a",
+        href=True,
+    ):
+
+        href = (
+            anchor.get("href") or ""
+        ).strip()
 
         if not href or href.startswith(
             ("#", "mailto:", "tel:", "javascript:")
         ):
             continue
 
-        visible = anchor.get_text(" ", strip=True)
-        aria = str(anchor.get("aria-label") or "")
-        title = str(anchor.get("title") or "")
+        visible = anchor.get_text(
+            " ",
+            strip=True,
+        )
+
+        aria = str(
+            anchor.get("aria-label") or ""
+        )
+
+        title = str(
+            anchor.get("title") or ""
+        )
 
         combined = (
             f"{visible} {aria} {title} {href}"
@@ -573,19 +656,23 @@ def find_privacy_policy_links(
             combined,
         )
 
-        is_policy_link = any(
+        if not any(
             term.lower() in combined
             or term.lower() in normalized_combined
             for term in POLICY_TERMS
-        )
-
-        if not is_policy_link:
+        ):
             continue
 
-        absolute = urljoin(page_url, href)
+        absolute = urljoin(
+            page_url,
+            href,
+        )
 
         try:
-            normalized = normalize_url(absolute)
+            normalized = normalize_url(
+                absolute
+            )
+
         except ScanError:
             continue
 
@@ -598,27 +685,25 @@ def find_privacy_policy_links(
 
         seen.add(normalized)
 
-        found.append(
-            {
-                "url": normalized,
-                "label": (
-                    visible
-                    or aria
-                    or title
-                    or "개인정보 처리방침 관련 링크"
-                ),
-                "same_host": (
-                    "true" if host == base_host else "false"
-                ),
-            }
-        )
+        found.append({
+            "url": normalized,
+            "label": (
+                visible
+                or aria
+                or title
+                or "개인정보 처리방침 관련 링크"
+            ),
+            "same_host": (
+                "true" if host == base_host else "false"
+            ),
+        })
 
     return found
 
 
-# --------------------------------------------------
-# 분석 근거 문맥 추출
-# --------------------------------------------------
+# ==========================================
+# EVIDENCE EXTRACTION
+# ==========================================
 
 def _evidence_context(
     text: str,
@@ -626,10 +711,16 @@ def _evidence_context(
     end: int,
     radius: int = 95,
 ) -> str:
-    """검색 표현 주변의 원문 일부를 추출한다."""
 
-    left = max(0, start - radius)
-    right = min(len(text), end + radius)
+    left = max(
+        0,
+        start - radius,
+    )
+
+    right = min(
+        len(text),
+        end + radius,
+    )
 
     excerpt = text[left:right].strip()
 
@@ -642,21 +733,22 @@ def _evidence_context(
     return excerpt
 
 
-# --------------------------------------------------
-# 11개 항목 분석
-# --------------------------------------------------
+# ==========================================
+# ANALYZE 11 PRIVACY TOPICS
+# ==========================================
 
-def analyze_policy_text(html: str) -> list[TopicResult]:
-    """개인정보 처리방침 HTML에서 11개 항목의 문구를 찾는다.
+def analyze_policy_text(
+    html: str,
+) -> list[TopicResult]:
 
-    문구 발견은 해당 주제의 설명이 있다는 의미일 뿐,
-    정책의 충분성이나 실제 준수 여부를 증명하지 않는다.
-    """
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 프로그램 코드나 스타일에 포함된 텍스트는 분석에서 제외한다.
-    for tag in soup(["script", "style", "noscript", "svg"]):
+    for tag in soup(
+        ["script", "style", "noscript", "svg"]
+    ):
         tag.decompose()
 
     text = re.sub(
@@ -665,13 +757,15 @@ def analyze_policy_text(html: str) -> list[TopicResult]:
         soup.get_text(" ", strip=True),
     ).strip()
 
-    results: list[TopicResult] = []
+    results = []
 
     for topic, patterns in TOPIC_PATTERNS.items():
+
         evidence = ""
         matched_phrase = ""
 
         for pattern in patterns:
+
             match = re.search(
                 pattern,
                 text,
@@ -679,7 +773,9 @@ def analyze_policy_text(html: str) -> list[TopicResult]:
             )
 
             if match:
-                matched_phrase = match.group(0).strip()
+                matched_phrase = (
+                    match.group(0).strip()
+                )
 
                 evidence = _evidence_context(
                     text,
@@ -701,29 +797,30 @@ def analyze_policy_text(html: str) -> list[TopicResult]:
     return results
 
 
-# --------------------------------------------------
-# 전체 웹사이트 분석
-# --------------------------------------------------
+# ==========================================
+# COMPLETE WEBSITE ANALYSIS
+# ==========================================
 
 def analyze_website(raw_url: str) -> dict:
-    """홈페이지를 가져오고 처리방침 링크와 11개 항목을 분석한다."""
 
     homepage = fetch_public_html(raw_url)
 
-    homepage_parsed = urlsplit(homepage.final_url)
+    homepage_parsed = urlsplit(
+        homepage.final_url
+    )
 
     homepage_host = (
         homepage_parsed.hostname or ""
     ).lower()
 
-    is_https = homepage_parsed.scheme == "https"
+    is_https = (
+        homepage_parsed.scheme == "https"
+    )
 
-    # 입력한 주소 자체가 정책 페이지로 보이는 경우 직접 분석한다.
     normalized_path = (
         homepage_parsed.path.lower()
         .replace("-", "")
         .replace("_", "")
-        .replace(" ", "")
     )
 
     path_is_policy = any(
@@ -737,17 +834,17 @@ def analyze_website(raw_url: str) -> dict:
     policy_error = None
 
     if path_is_policy:
+
         policy = homepage
 
-        links = [
-            {
-                "url": homepage.final_url,
-                "label": "입력한 페이지 자체를 정책 페이지로 분석",
-                "same_host": "true",
-            }
-        ]
+        links = [{
+            "url": homepage.final_url,
+            "label": "입력한 페이지 자체를 정책 페이지로 분석",
+            "same_host": "true",
+        }]
 
     else:
+
         links = find_privacy_policy_links(
             homepage.html,
             homepage.final_url,
@@ -762,8 +859,8 @@ def analyze_website(raw_url: str) -> dict:
         policy = None
 
         for candidate in internal_links[:3]:
+
             try:
-                # 처리방침 주소도 동일하게 검증하고 접속한다.
                 policy = fetch_public_html(
                     candidate["url"]
                 )
@@ -778,7 +875,6 @@ def analyze_website(raw_url: str) -> dict:
                 + policy_error
             )
 
-    # 처리방침을 찾은 경우 11개 항목을 검사한다.
     policy_results = (
         analyze_policy_text(policy.html)
         if policy
@@ -795,4 +891,248 @@ def analyze_website(raw_url: str) -> dict:
         "policy_error": policy_error,
         "topic_results": policy_results,
         "homepage_host": homepage_host,
+    }
+
+
+# ==========================================
+# VIRUSTOTAL PUBLIC API V3
+# ==========================================
+
+
+def virustotal_url_id(raw_url: str) -> str:
+    """Create an unpadded URL-safe Base64 URL identifier."""
+
+    normalized = normalize_url(raw_url)
+
+    return base64.urlsafe_b64encode(
+        normalized.encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
+def _virustotal_request(
+    method: str,
+    endpoint: str,
+    api_key: str,
+    **kwargs,
+) -> dict:
+    """Send one VirusTotal API request and handle common errors."""
+
+    key = (api_key or "").strip()
+
+    if not key:
+        raise VirusTotalError(
+            "VirusTotal API 키가 설정되지 않았습니다. "
+            "Streamlit Secrets에 VIRUSTOTAL_API_KEY를 등록해 주세요."
+        )
+
+    headers = {
+        "x-apikey": key,
+        "accept": "application/json",
+        "user-agent": "PrivacyScanSchoolProject/2.2",
+    }
+
+    try:
+        response = requests.request(
+            method=method.upper(),
+            url=(
+                f"{VIRUSTOTAL_BASE_URL}"
+                f"{endpoint}"
+            ),
+            headers=headers,
+            timeout=VIRUSTOTAL_TIMEOUT_SECONDS,
+            allow_redirects=False,
+            **kwargs,
+        )
+
+    except requests.Timeout as exc:
+        raise VirusTotalError(
+            "VirusTotal 응답 시간이 초과되었습니다. "
+            "잠시 후 다시 시도해 주세요."
+        ) from exc
+
+    except requests.RequestException as exc:
+        raise VirusTotalError(
+            "VirusTotal 서버에 연결하지 못했습니다. "
+            "네트워크 상태를 확인해 주세요."
+        ) from exc
+
+    # No existing report
+    if response.status_code == 404:
+        raise VirusTotalNotFoundError(
+            "VirusTotal에서 이 URL의 기존 보고서를 찾지 못했습니다. "
+            "새 검사를 요청할 수 있습니다."
+        )
+
+    # Invalid API key
+    if response.status_code == 401:
+        raise VirusTotalError(
+            "API 키가 올바르지 않습니다. "
+            "Streamlit Secrets의 키를 확인해 주세요."
+        )
+
+    # Permission error
+    if response.status_code == 403:
+        raise VirusTotalError(
+            "이 API 요청은 현재 계정 권한으로 사용할 수 없습니다. "
+            "공개 API 지원 범위인지 확인해 주세요."
+        )
+
+    # Rate limit
+    if response.status_code == 429:
+        raise VirusTotalError(
+            "VirusTotal 공개 API 요청 한도에 도달했습니다. "
+            "기본 한도는 분당 4회, 하루 500회입니다. "
+            "잠시 후 다시 시도해 주세요."
+        )
+
+    # Server error
+    if response.status_code >= 500:
+        raise VirusTotalError(
+            f"VirusTotal 서버에서 일시적인 오류 "
+            f"(HTTP {response.status_code})가 발생했습니다."
+        )
+
+    if not response.ok:
+        raise VirusTotalError(
+            f"VirusTotal 요청에 실패했습니다. "
+            f"(HTTP {response.status_code})"
+        )
+
+    try:
+        payload = response.json()
+
+    except ValueError as exc:
+        raise VirusTotalError(
+            "VirusTotal 응답을 JSON으로 해석하지 못했습니다."
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise VirusTotalError(
+            "VirusTotal 응답 형식이 예상과 다릅니다."
+        )
+
+    return payload
+
+
+# ==========================================
+# 1. LOOK UP EXISTING URL REPORT
+# ==========================================
+
+def lookup_virustotal_url(
+    api_key: str,
+    raw_url: str,
+) -> dict:
+    """Retrieve the latest URL reputation report.
+
+    The user interface must obtain explicit consent before calling this
+    function because VirusTotal warns that queried indicators may be
+    included in its community dataset.
+    """
+
+    url_id = virustotal_url_id(raw_url)
+
+    payload = _virustotal_request(
+        "GET",
+        f"/urls/{url_id}",
+        api_key,
+    )
+
+    data = payload.get("data") or {}
+    attributes = data.get("attributes") or {}
+
+    if not isinstance(attributes, dict):
+        raise VirusTotalError(
+            "URL 평판 보고서의 형식이 올바르지 않습니다."
+        )
+
+    return {
+        "url": normalize_url(raw_url),
+        "url_id": data.get("id") or url_id,
+        "attributes": attributes,
+        "links": data.get("links") or {},
+    }
+
+
+# ==========================================
+# 2. SUBMIT A NEW URL SCAN
+# ==========================================
+
+def submit_virustotal_url(
+    api_key: str,
+    raw_url: str,
+) -> dict:
+    """Submit a new public URL scan."""
+
+    normalized = normalize_url(raw_url)
+
+    payload = _virustotal_request(
+        "POST",
+        "/urls",
+        api_key,
+        data={
+            "url": normalized
+        },
+    )
+
+    data = payload.get("data") or {}
+
+    analysis_id = data.get("id")
+
+    if not analysis_id:
+        raise VirusTotalError(
+            "검사 요청은 전송했지만 "
+            "분석 ID를 응답에서 찾지 못했습니다."
+        )
+
+    return {
+        "url": normalized,
+        "analysis_id": analysis_id,
+        "url_id": virustotal_url_id(normalized),
+        "status": (
+            data.get("attributes") or {}
+        ).get("status", "queued"),
+    }
+
+
+# ==========================================
+# 3. GET ANALYSIS STATUS
+# ==========================================
+
+def get_virustotal_analysis(
+    api_key: str,
+    analysis_id: str,
+) -> dict:
+    """Retrieve analysis status and available engine results."""
+
+    safe_id = (analysis_id or "").strip()
+
+    if (
+        not safe_id
+        or "/" in safe_id
+        or "?" in safe_id
+    ):
+        raise VirusTotalError(
+            "분석 ID 형식이 올바르지 않습니다."
+        )
+
+    payload = _virustotal_request(
+        "GET",
+        f"/analyses/{safe_id}",
+        api_key,
+    )
+
+    data = payload.get("data") or {}
+    attributes = data.get("attributes") or {}
+
+    if not isinstance(attributes, dict):
+        raise VirusTotalError(
+            "분석 결과의 형식이 올바르지 않습니다."
+        )
+
+    return {
+        "analysis_id": data.get("id") or safe_id,
+        "status": attributes.get("status", "unknown"),
+        "stats": attributes.get("stats") or {},
+        "results": attributes.get("results") or {},
+        "date": attributes.get("date"),
     }
